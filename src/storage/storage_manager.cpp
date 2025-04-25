@@ -36,6 +36,12 @@ StorageManager::StorageManager(const std::string& databasePath, bool readOnly,
 
 StorageManager::~StorageManager() = default;
 
+Table* StorageManager::getTable(table_id_t tableID) {
+    std::lock_guard lck{mtx};
+    KU_ASSERT(tables.contains(tableID));
+    return tables.at(tableID).get();
+}
+
 FileHandle* StorageManager::initFileHandle(const std::string& fileName, VirtualFileSystem* vfs,
     main::ClientContext* context) const {
     if (main::DBConfig::isDBPathInMemory(databasePath)) {
@@ -99,30 +105,21 @@ void StorageManager::createNodeTable(NodeTableCatalogEntry* entry) {
     tables[entry->getTableID()] = std::make_unique<NodeTable>(this, entry, &memoryManager);
 }
 
-void StorageManager::createRelTable(RelTableCatalogEntry* entry) {
-    tables[entry->getTableID()] = std::make_unique<RelTable>(entry, this, &memoryManager);
-}
-
-void StorageManager::createRelTableGroup(const RelGroupCatalogEntry* entry,
-    const main::ClientContext* context) {
-    for (const auto id : entry->getRelTableIDs()) {
-        createRelTable(context->getCatalog()
-                           ->getTableCatalogEntry(context->getTransaction(), id)
-                           ->ptrCast<RelTableCatalogEntry>());
+void StorageManager::createRelTableGroup(RelGroupCatalogEntry* entry) {
+    for (auto& info : entry->getRelEntryInfos()) {
+        tables[info.oid] = std::make_unique<RelTable>(entry, info.nodePair.srcTableID,
+            info.nodePair.dstTableID, this, &memoryManager);
     }
 }
 
-void StorageManager::createTable(CatalogEntry* entry, const main::ClientContext* context) {
+void StorageManager::createTable(TableCatalogEntry* entry) {
     std::lock_guard lck{mtx};
     switch (entry->getType()) {
     case CatalogEntryType::NODE_TABLE_ENTRY: {
         createNodeTable(entry->ptrCast<NodeTableCatalogEntry>());
     } break;
-    case CatalogEntryType::REL_TABLE_ENTRY: {
-        createRelTable(entry->ptrCast<RelTableCatalogEntry>());
-    } break;
     case CatalogEntryType::REL_GROUP_ENTRY: {
-        createRelTableGroup(entry->ptrCast<RelGroupCatalogEntry>(), context);
+        createRelTableGroup(entry->ptrCast<RelGroupCatalogEntry>());
     } break;
     default: {
         KU_UNREACHABLE;
@@ -143,10 +140,34 @@ ShadowFile& StorageManager::getShadowFile() const {
 void StorageManager::reclaimDroppedTables(const main::ClientContext& clientContext) {
     std::vector<table_id_t> droppedTables;
     for (const auto& [tableID, table] : tables) {
-        if (!clientContext.getCatalog()->containsTable(&DUMMY_CHECKPOINT_TRANSACTION, tableID,
-                true)) {
-            table->reclaimStorage(*dataFH);
-            droppedTables.push_back(tableID);
+        switch (table->getTableType()) {
+        case TableType::NODE: {
+            if (!clientContext.getCatalog()->containsTable(&DUMMY_CHECKPOINT_TRANSACTION, tableID,
+                    true)) {
+                table->reclaimStorage(*dataFH);
+                droppedTables.push_back(tableID);
+            }
+        } break;
+        case TableType::REL: {
+            auto& relTable = table->cast<RelTable>();
+            auto relGroupID = relTable.getRelGroupID();
+            if (!clientContext.getCatalog()->containsTable(&DUMMY_CHECKPOINT_TRANSACTION,
+                    relGroupID, true)) {
+                table->reclaimStorage(*dataFH);
+                droppedTables.push_back(tableID);
+            } else {
+                auto relGroupEntry = clientContext.getCatalog()->getTableCatalogEntry(
+                    &DUMMY_CHECKPOINT_TRANSACTION, relGroupID);
+                if (!relGroupEntry->cast<RelGroupCatalogEntry>().getRelEntryInfo(
+                        relTable.getFromNodeTableID(), relTable.getToNodeTableID())) {
+                    table->reclaimStorage(*dataFH);
+                    droppedTables.push_back(tableID);
+                }
+            }
+        }
+        default: {
+            // DO NOTHING.
+        }
         }
     }
     for (auto tableID : droppedTables) {
@@ -168,26 +189,30 @@ void StorageManager::checkpoint(main::ClientContext& clientContext) {
     Serializer ser(writer);
     const auto nodeTableEntries =
         clientContext.getCatalog()->getNodeTableEntries(&DUMMY_CHECKPOINT_TRANSACTION);
-    const auto relTableEntries =
-        clientContext.getCatalog()->getRelTableEntries(&DUMMY_CHECKPOINT_TRANSACTION);
-    const auto numTables = nodeTableEntries.size() + relTableEntries.size();
+    auto numTables = nodeTableEntries.size();
+    const auto relGroupEntries =
+        clientContext.getCatalog()->getRelGroupEntries(&DUMMY_CHECKPOINT_TRANSACTION);
+    for (auto& relGroupEntry : relGroupEntries) {
+        numTables += relGroupEntry->getNumRelTables();
+    }
     ser.writeDebuggingInfo("num_tables");
     ser.write<uint64_t>(numTables);
-    for (const auto tableEntry : nodeTableEntries) {
-        if (!tables.contains(tableEntry->getTableID())) {
-            throw RuntimeException(
-                stringFormat("Checkpoint failed: table {} not found in storage manager.",
-                    tableEntry->getName()));
+    for (const auto entry : nodeTableEntries) {
+        if (!tables.contains(entry->getTableID())) {
+            throw RuntimeException(stringFormat(
+                "Checkpoint failed: table {} not found in storage manager.", entry->getName()));
         }
-        tables.at(tableEntry->getTableID())->checkpoint(ser, tableEntry);
+        tables.at(entry->getTableID())->checkpoint(ser, entry);
     }
-    for (const auto tableEntry : relTableEntries) {
-        if (!tables.contains(tableEntry->getTableID())) {
-            throw RuntimeException(
-                stringFormat("Checkpoint failed: table {} not found in storage manager.",
-                    tableEntry->getName()));
+    for (const auto entry : relGroupEntries) {
+        for (auto& info : entry->getRelEntryInfos()) {
+            if (!tables.contains(info.oid)) {
+                throw RuntimeException(stringFormat(
+                    "Checkpoint failed: table {} not found in storage manager.", entry->getName()));
+            }
+            tables.at(info.oid)->checkpoint(ser, entry);
         }
-        tables.at(tableEntry->getTableID())->checkpoint(ser, tableEntry);
+        entry->vacuumColumnIDs(1);
     }
     reclaimDroppedTables(clientContext);
     ser.writeDebuggingInfo("page_manager");

@@ -214,6 +214,14 @@ bool NodeTableScanState::scanNext(Transaction* transaction) {
     return true;
 }
 
+static std::vector<LogicalType> getNodeTableColumnTypes(const NodeTableCatalogEntry& table) {
+    std::vector<LogicalType> types;
+    for (auto& property : table.getProperties()) {
+        types.push_back(property.getType().copy());
+    }
+    return types;
+}
+
 NodeTable::NodeTable(const StorageManager* storageManager,
     const NodeTableCatalogEntry* nodeTableEntry, MemoryManager* memoryManager, Deserializer* deSer)
     : Table{nodeTableEntry, storageManager, memoryManager},
@@ -231,8 +239,8 @@ NodeTable::NodeTable(const StorageManager* storageManager,
 
     initializePKIndex(storageManager->getDatabasePath(), nodeTableEntry, deSer);
     nodeGroups = std::make_unique<NodeGroupCollection>(*memoryManager,
-        LocalNodeTable::getNodeTableColumnTypes(*nodeTableEntry), enableCompression,
-        storageManager->getDataFH(), deSer, &versionRecordHandler);
+        getNodeTableColumnTypes(*nodeTableEntry), enableCompression, storageManager->getDataFH(),
+        deSer, &versionRecordHandler);
 }
 
 std::unique_ptr<NodeTable> NodeTable::loadTable(Deserializer& deSer, const Catalog& catalog,
@@ -269,8 +277,7 @@ void NodeTable::initializePKIndex(const std::string& databasePath,
 
 row_idx_t NodeTable::getNumTotalRows(const Transaction* transaction) {
     auto numLocalRows = 0u;
-    if (const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID,
-            LocalStorage::NotExistAction::RETURN_NULL)) {
+    if (const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID)) {
         numLocalRows = localTable->getNumTotalRows();
     }
     return numLocalRows + nodeGroups->getNumTotalRows();
@@ -284,8 +291,7 @@ void NodeTable::initScanState(Transaction* transaction, TableScanState& scanStat
         nodeGroup = nodeGroups->getNodeGroup(nodeScanState.nodeGroupIdx);
     } break;
     case TableScanSource::UNCOMMITTED: {
-        const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID,
-            LocalStorage::NotExistAction::RETURN_NULL);
+        const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID);
         KU_ASSERT(localTable);
         auto& localNodeTable = localTable->cast<LocalNodeTable>();
         nodeGroup = localNodeTable.getNodeGroup(nodeScanState.nodeGroupIdx);
@@ -345,8 +351,7 @@ offset_t NodeTable::validateUniquenessConstraint(const Transaction* transaction,
             [&](offset_t offset_) { return isVisible(transaction, offset_); })) {
         return offset;
     }
-    if (const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID,
-            LocalStorage::NotExistAction::RETURN_NULL)) {
+    if (const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID)) {
         return localTable->cast<LocalNodeTable>().validateUniquenessConstraint(transaction,
             *pkVector);
     }
@@ -375,8 +380,7 @@ void NodeTable::insert(Transaction* transaction, TableInsertState& insertState) 
     if (nodeInsertState.nodeIDVector.isNull(nodeIDSelVector[0])) {
         return;
     }
-    const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID,
-        LocalStorage::NotExistAction::CREATE);
+    const auto localTable = transaction->getLocalStorage()->getOrCreateLocalTable(*this);
     validatePkNotExists(transaction, const_cast<ValueVector*>(&nodeInsertState.pkVector));
     localTable->insert(transaction, insertState);
     if (transaction->shouldLogToWAL()) {
@@ -405,8 +409,7 @@ void NodeTable::update(Transaction* transaction, TableUpdateState& updateState) 
     }
     const auto nodeOffset = nodeUpdateState.nodeIDVector.readNodeOffset(pos);
     if (transaction->isUnCommitted(tableID, nodeOffset)) {
-        const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID,
-            LocalStorage::NotExistAction::RETURN_NULL);
+        const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID);
         KU_ASSERT(localTable);
         auto dummyTrx = Transaction::getDummyTransactionFromExistingOne(*transaction);
         localTable->update(&dummyTrx, updateState);
@@ -441,9 +444,8 @@ bool NodeTable::delete_(Transaction* transaction, TableDeleteState& deleteState)
     }
     bool isDeleted = false;
     const auto nodeOffset = nodeDeleteState.nodeIDVector.readNodeOffset(pos);
-    const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID,
-        LocalStorage::NotExistAction::RETURN_NULL);
-    if (localTable && transaction->isUnCommitted(tableID, nodeOffset)) {
+    if (const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID);
+        localTable && transaction->isUnCommitted(tableID, nodeOffset)) {
         auto dummyTrx = Transaction::getDummyTransactionFromExistingOne(*transaction);
         isDeleted = localTable->delete_(&dummyTrx, deleteState);
     } else {
@@ -473,8 +475,7 @@ void NodeTable::addColumn(Transaction* transaction, TableAddColumnState& addColu
         dataFH, memoryManager, shadowFile, enableCompression));
     LocalTable* localTable = nullptr;
     if (transaction->getLocalStorage()) {
-        localTable = transaction->getLocalStorage()->getLocalTable(tableID,
-            LocalStorage::NotExistAction::RETURN_NULL);
+        localTable = transaction->getLocalStorage()->getLocalTable(tableID);
     }
     if (localTable) {
         localTable->addColumn(transaction, addColumnState);
@@ -516,7 +517,7 @@ void NodeTable::commit(Transaction* transaction, TableCatalogEntry* tableEntry,
     // 2. Set deleted flag for tuples that are deleted in local storage.
     row_idx_t numLocalRows = 0u;
     for (auto localNodeGroupIdx = 0u; localNodeGroupIdx < localNodeTable.getNumNodeGroups();
-         localNodeGroupIdx++) {
+        localNodeGroupIdx++) {
         const auto localNodeGroup = localNodeTable.getNodeGroup(localNodeGroupIdx);
         if (localNodeGroup->hasDeletions(transaction)) {
             // TODO(Guodong): Assume local storage is small here. Should optimize the loop away by
@@ -606,9 +607,7 @@ void NodeTable::reclaimStorage(FileHandle& dataFH) {
 
 TableStats NodeTable::getStats(const Transaction* transaction) const {
     auto stats = nodeGroups->getStats();
-    const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID,
-        LocalStorage::NotExistAction::RETURN_NULL);
-    if (localTable) {
+    if (const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID)) {
         const auto localStats = localTable->cast<LocalNodeTable>().getStats();
         stats.merge(localStats);
     }
@@ -639,9 +638,8 @@ bool NodeTable::isVisibleNoLock(const Transaction* transaction, offset_t offset)
 bool NodeTable::lookupPK(const Transaction* transaction, ValueVector* keyVector, uint64_t vectorPos,
     offset_t& result) const {
     if (transaction->getLocalStorage()) {
-        const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID,
-            LocalStorage::NotExistAction::RETURN_NULL);
-        if (localTable && localTable->cast<LocalNodeTable>().lookupPK(transaction, keyVector,
+        if (const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID);
+            localTable && localTable->cast<LocalNodeTable>().lookupPK(transaction, keyVector,
                               vectorPos, result)) {
             return true;
         }
@@ -657,7 +655,7 @@ void NodeTable::scanPKColumn(const Transaction* transaction, PKColumnScanHelper&
 
     const auto numNodeGroups = nodeGroups_.getNumNodeGroups();
     for (node_group_idx_t nodeGroupToScan = 0u; nodeGroupToScan < numNodeGroups;
-         ++nodeGroupToScan) {
+        ++nodeGroupToScan) {
         scanState->nodeGroup = nodeGroups_.getNodeGroupNoLock(nodeGroupToScan);
 
         // It is possible for the node group to have no chunked groups if we are rolling back due to

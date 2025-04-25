@@ -1,6 +1,6 @@
 #pragma once
 
-#include "catalog/catalog_entry/rel_table_catalog_entry.h"
+#include "catalog/catalog_entry/rel_group_catalog_entry.h"
 #include "storage/store/rel_table_data.h"
 #include "storage/store/table.h"
 
@@ -141,7 +141,8 @@ public:
     using rel_multiplicity_constraint_throw_func_t =
         std::function<void(const std::string&, common::offset_t, common::RelDataDirection)>;
 
-    RelTable(catalog::RelTableCatalogEntry* relTableEntry, const StorageManager* storageManager,
+    RelTable(catalog::RelGroupCatalogEntry* relGroupEntry, common::table_id_t fromTableID,
+        common::table_id_t toTableID, const StorageManager* storageManager,
         MemoryManager* memoryManager, common::Deserializer* deSer = nullptr);
 
     static std::unique_ptr<RelTable> loadTable(common::Deserializer& deSer,
@@ -178,8 +179,7 @@ public:
     }
     common::column_id_t getNumColumns() const {
         KU_ASSERT(directedRelData.size() >= 1);
-        RUNTIME_CHECK(for (const auto& relData
-                           : directedRelData) {
+        RUNTIME_CHECK(for (const auto& relData : directedRelData) {
             KU_ASSERT(relData->getNumColumns() == directedRelData[0]->getNumColumns());
         });
         return directedRelData[0]->getNumColumns();
@@ -213,6 +213,7 @@ public:
         common::row_idx_t numRows_, CSRNodeGroupScanSource source) const;
 
     std::vector<common::RelDataDirection> getStorageDirections() const;
+    common::table_id_t getRelGroupID() const { return relGroupID; }
 
 private:
     static void prepareCommitForNodeGroup(const transaction::Transaction* transaction,
@@ -232,9 +233,8 @@ private:
     void checkRelMultiplicityConstraint(transaction::Transaction* transaction,
         const TableInsertState& state) const;
 
-    void commitRelTableData(common::RelDataDirection direction);
-
 private:
+    common::table_id_t relGroupID;
     common::table_id_t fromNodeTableID;
     common::table_id_t toNodeTableID;
     std::mutex relOffsetMtx;
