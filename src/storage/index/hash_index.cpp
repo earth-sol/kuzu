@@ -429,9 +429,11 @@ PrimaryKeyIndex::PrimaryKeyIndex(FileHandle* dataFH, bool inMemMode, PhysicalTyp
     bool newIndex = this->firstHeaderPage == INVALID_PAGE_IDX;
 
     if (newIndex) {
-        this->firstHeaderPage = fileHandle->addNewPages(INDEX_HEADER_PAGES);
         hashIndexHeadersForReadTrx.resize(NUM_HASH_INDEXES);
         hashIndexHeadersForWriteTrx.resize(NUM_HASH_INDEXES);
+
+        hashIndexDiskArrays = std::make_unique<DiskArrayCollection>(*fileHandle, *shadowFile,
+            true /*bypassShadowing*/);
     } else {
         size_t headerIdx = 0;
         for (size_t headerPageIdx = 0; headerPageIdx < INDEX_HEADER_PAGES; headerPageIdx++) {
@@ -447,11 +449,11 @@ PrimaryKeyIndex::PrimaryKeyIndex(FileHandle* dataFH, bool inMemMode, PhysicalTyp
         hashIndexHeadersForWriteTrx.assign(hashIndexHeadersForReadTrx.begin(),
             hashIndexHeadersForReadTrx.end());
         KU_ASSERT(headerIdx == NUM_HASH_INDEXES);
+        hashIndexDiskArrays = std::make_unique<DiskArrayCollection>(*fileHandle, *shadowFile,
+            firstHeaderPage +
+                INDEX_HEADER_PAGES /*firstHeaderPage for the DAC follows the index header pages*/,
+            true /*bypassShadowing*/);
     }
-    hashIndexDiskArrays = std::make_unique<DiskArrayCollection>(*fileHandle, *shadowFile,
-        this->firstHeaderPage +
-            INDEX_HEADER_PAGES /*firstHeaderPage follows the index header pages*/,
-        true /*bypassShadowing*/);
 
     if (keyDataTypeID == PhysicalTypeID::STRING) {
         if (inMemMode) {
@@ -486,12 +488,6 @@ PrimaryKeyIndex::PrimaryKeyIndex(FileHandle* dataFH, bool inMemMode, PhysicalTyp
             }
         },
         [&](auto) { KU_UNREACHABLE; });
-
-    if (newIndex && !inMemMode) {
-        // checkpoint the creation of the index so that if we need to rollback it will be to a
-        // state we can retry from (an empty index with the disk arrays initialized)
-        checkpoint(true /* forceCheckpointAll */);
-    }
 }
 
 bool PrimaryKeyIndex::lookup(const Transaction* trx, ValueVector* keyVector, uint64_t vectorPos,
@@ -556,6 +552,10 @@ void PrimaryKeyIndex::checkpointInMemory() {
 
 void PrimaryKeyIndex::writeHeaders() {
     size_t headerIdx = 0;
+    if (firstHeaderPage == INVALID_PAGE_IDX) {
+        firstHeaderPage =
+            fileHandle->addNewPages(NUM_HEADER_PAGES + 1 /*first DiskArrayCollection header page*/);
+    }
     for (size_t headerPageIdx = 0; headerPageIdx < INDEX_HEADER_PAGES; headerPageIdx++) {
         ShadowUtils::updatePage(*fileHandle, firstHeaderPage + headerPageIdx,
             true /*writing all the data to the page; no need to read original*/, shadowFile,
@@ -591,7 +591,7 @@ void PrimaryKeyIndex::checkpoint(bool forceCheckpointAll) {
     }
     if (indexChanged || forceCheckpointAll) {
         writeHeaders();
-        hashIndexDiskArrays->checkpoint();
+        hashIndexDiskArrays->checkpoint(firstHeaderPage + NUM_HEADER_PAGES);
     }
     if (overflowFile) {
         overflowFile->checkpoint(forceCheckpointAll);
